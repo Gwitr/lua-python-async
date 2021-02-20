@@ -79,32 +79,36 @@ class Function(_LuaReferenceContainer):
 class Table(_LuaReferenceContainer):
     
     def __getitem__(self, k):
-        self._pushrefval()
-        
-        if lua54.lua_type(self.thread.L, -1) != lua54.LUA_TTABLE:
-            raise ValueError("Invalid table")
-        
-        if isinstance(k, str):
-            s = k.encode(self.thread.runtime.encoding)
-            lua54.lua_pushlstring(self.thread.L, s, len(s))
+        try:
+            self._pushrefval()
+            
+            if lua54.lua_type(self.thread.L, -1) != lua54.LUA_TTABLE:
+                raise ValueError("Invalid table")
+            
+            if isinstance(k, str):
+                s = k.encode(self.thread.runtime.encoding)
+                lua54.lua_pushlstring(self.thread.L, s, len(s))
 
-        elif k is True:
-            lua54.lua_pushboolean(self.thread.L, 1)
+            elif k is True:
+                lua54.lua_pushboolean(self.thread.L, 1)
 
-        elif k is False:
-            lua54.lua_pushboolean(self.thread.L, 0)
+            elif k is False:
+                lua54.lua_pushboolean(self.thread.L, 0)
 
-        elif isinstance(k, _LuaReferenceContainer):
-            k._pushrefval()
-        
-        else:
-            k = int(k)
-            lua54.lua_pushnumber(self.thread.L, k)
-        
-        luavalue = lua54.lua_gettable(self.thread.L, -2)
-        pyvalue = self.thread._to_python_type(-1)
-        lua54.lua_pop(self.thread.L, 2)
-        return pyvalue
+            elif isinstance(k, _LuaReferenceContainer):
+                k._pushrefval()
+            
+            else:
+                k = int(k)
+                lua54.lua_pushnumber(self.thread.L, k)
+            
+            luavalue = lua54.lua_gettable(self.thread.L, -2)
+            pyvalue = self.thread._to_python_type(-1)
+            lua54.lua_pop(self.thread.L, 2)
+            return pyvalue
+        except OSError:
+            print("OSError caught: stack top is", lua54.lua_gettop(self.thread.L))
+            raise
 
     def lua_rawequal(self, other):
         if not isinstance(other, Table):
@@ -190,11 +194,13 @@ class Coroutine():
         self.return_value = None
         self._nargs = 0
         self.callback_results = None
-        
-        self.L = lua54.lua_newthread(self.runtime.L)
-        
-        lua54.lua_pushthread(self.runtime.L, self.L)
-        self.ref = lua54.luaL_ref(self.runtime.L, lua54.LUA_REGISTRYINDEX)
+
+        try:
+            self.L = lua54.lua_newthread(self.runtime.L)
+            self.ref = lua54.luaL_ref(self.runtime.L, lua54.LUA_REGISTRYINDEX)
+        except OSError:
+            print("OSError caught: stack top is", lua54.lua_gettop(runtime.L))
+            raise
 
     def __del__(self):
         lua54.luaL_unref(self.runtime.L, lua54.LUA_REGISTRYINDEX, self.ref)
@@ -350,6 +356,8 @@ class Runtime():
         
         self.L = lua54.luaL_newstate()
         lua54.luaL_loadstring(self.L, code.encode(self.encoding))
+        if lua54.lua_type(self.L, -1) == lua54.LUA_TSTRING:
+            raise ValueError(lua54.lua_tolstring(self.L, -1, None).decode(self.encoding))
         
         lua54.luaopen_base(self.L)
         lua54.lua_pop(self.L, 1)
@@ -383,8 +391,14 @@ class Runtime():
         self.lua54.lua_close(self.L)
 
     def globals(self):
-        lua54.lua_getglobal(self.dummy_coroutine.L, b"_G")
-        return Table(self.dummy_coroutine)
+        try:
+            lua54.lua_getglobal(self.dummy_coroutine.L, b"_G")
+            t = Table(self.dummy_coroutine)
+            lua54.lua_pop(self.dummy_coroutine.L, 1)
+            return t
+        except OSError:
+            print("OSError caught: stack top is", lua54.lua_gettop(self.dummy_coroutine.L))
+            raise
     
     def register_command(self, callback, name, nargs=None):
         def cb(state):
