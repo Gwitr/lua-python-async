@@ -1,7 +1,9 @@
 import os
+import sys
 import time
 import ctypes
 import string
+import traceback
 
 class FuncPtrWrapper():
 
@@ -44,7 +46,8 @@ class _LuaReferenceContainer():
     def __init__(self, thread):
         self.thread = thread
         self.ref = lua54.luaL_ref(self.thread.L, lua54.LUA_REGISTRYINDEX)
-        lua54.lua_pushnil(self.thread.L)
+        # lua54.lua_pushnil(self.thread.L)
+        self._pushrefval()
 
     def __del__(self):
         lua54.luaL_unref(self.thread.L, lua54.LUA_REGISTRYINDEX, self.ref)
@@ -78,64 +81,129 @@ class Function(_LuaReferenceContainer):
 
 class Table(_LuaReferenceContainer):
     
+    def _get_owner(self):
+        return self.thread
+    
+    def _set_owner(self, thread):
+        if self.thread is not None:
+            raise NotImplementedError("transfering ownership of table between threads")
+        
+        if hasattr(self, "_runtime"):
+            self.thread = thread
+            lua54.lua_rawgeti(self._runtime.L, lua54.LUA_REGISTRYINDEX, self.ref)
+            lua54.lua_xmove(self._runtime.L, thread.L, 1)
+            lua54.luaL_unref(self._runtime.L, lua54.LUA_REGISTRYINDEX, self.ref)
+            self.ref = lua54.luaL_ref(self.thread.L, lua54.LUA_REGISTRYINDEX)
+        else:
+            raise NotImplementedError("_set_owner() on table returned by lua")
+
+    @classmethod
+    def new(cls, runtime):
+        self = cls.__new__(cls)
+        self.thread = None
+        self._runtime = runtime
+        
+        lua54.lua_createtable(self._runtime.L, 0, 0)
+        self.ref = lua54.luaL_ref(self._runtime.L, lua54.LUA_REGISTRYINDEX)
+        
+        return self
+    
+    def _pushrefval(self):
+        L = self._runtime.L if self.thread is None else self.thread.L
+        lua54.lua_rawgeti(L, lua54.LUA_REGISTRYINDEX, self.ref)
+    
+    def __del__(self):
+        if self.thread is None:
+            lua54.luaL_unref(self._runtime.L, lua54.LUA_REGISTRYINDEX, self.ref)
+        else:
+            lua54.luaL_unref(self.thread.L, lua54.LUA_REGISTRYINDEX, self.ref)
+    
+    def __setitem__(self, k, v):
+        rt = self._runtime if self.thread is None else self.thread
+        # if self.thread is not None:
+        #     raise NotImplementedError("__setitem__ on owned table")
+        
+        self._pushrefval()
+        Coroutine._push_python_object(rt, k)
+        Coroutine._push_python_object(rt, v)
+        lua54.lua_settable(rt.L, -3)
+        lua54.lua_pop(rt.L, 1)
+    
     def __getitem__(self, k):
+        L = self._runtime.L if self.thread is None else self.thread.L
+        runtime = self._runtime if self.thread is None else self.thread.runtime
         try:
             self._pushrefval()
             
-            if lua54.lua_type(self.thread.L, -1) != lua54.LUA_TTABLE:
+            if lua54.lua_type(L, -1) != lua54.LUA_TTABLE:
                 raise ValueError("Invalid table")
             
             if isinstance(k, str):
-                s = k.encode(self.thread.runtime.encoding)
-                lua54.lua_pushlstring(self.thread.L, s, len(s))
+                s = k.encode(runtime.encoding)
+                lua54.lua_pushlstring(L, s, len(s))
 
             elif k is True:
-                lua54.lua_pushboolean(self.thread.L, 1)
+                lua54.lua_pushboolean(L, 1)
 
             elif k is False:
-                lua54.lua_pushboolean(self.thread.L, 0)
+                lua54.lua_pushboolean(L, 0)
 
             elif isinstance(k, _LuaReferenceContainer):
                 k._pushrefval()
             
             else:
                 k = int(k)
-                lua54.lua_pushnumber(self.thread.L, k)
+                lua54.lua_pushnumber(L, k)
             
-            luavalue = lua54.lua_gettable(self.thread.L, -2)
-            pyvalue = self.thread._to_python_type(-1)
-            lua54.lua_pop(self.thread.L, 2)
+            luavalue = lua54.lua_gettable(L, -2)
+            if self.thread is None:
+                pyvalue = Coroutine._to_python_type(self._runtime, -1)
+            else:
+                pyvalue = self.thread._to_python_type(-1)
+            lua54.lua_pop(L, 2)
             return pyvalue
         except OSError:
-            print("OSError caught: stack top is", lua54.lua_gettop(self.thread.L))
+            print("OSError caught: stack top is", lua54.lua_gettop(L))
             raise
 
     def lua_rawequal(self, other):
         if not isinstance(other, Table):
             return False
+        
+        t = self._runtime if self.thread is None else self.thread
+        
         self._pushrefval()
         other._pushrefval()
-        res = lua54.lua_rawequal(self.thread.L, -1, -2) > 0
-        lua54.lua_pop(self.thread.L, 2)
+        res = lua54.lua_rawequal(t.L, -1, -2) > 0
+        lua54.lua_pop(t.L, 2)
         return res
 
     def __eq__(self, other):
         if not isinstance(other, Table):
             return False
+        
+        t = self._runtime if self.thread is None else self.thread
+        
         self._pushrefval()
         other._pushrefval()
-        res = lua54.lua_compare(self.thread.L, -1, -2, lua54.LUA_OPEQ) > 0
-        lua54.lua_pop(self.thread.L, 2)
+        res = lua54.lua_compare(t.L, -1, -2, lua54.LUA_OPEQ) > 0
+        lua54.lua_pop(t.L, 2)
         return res
 
     def _getc(self, i):
+        t = self._runtime if self.thread is None else self.thread
+        L = t.L
+        
         contents = []
         self._pushrefval()
-        lua54.lua_pushnil(self.thread.L)
-        while lua54.lua_next(self.thread.L, -2) != 0:
-            contents.append(self.thread._to_python_type(i))
-            lua54.lua_pop(self.thread.L, 1)
-        lua54.lua_pop(self.thread.L, 1)
+        lua54.lua_pushnil(L)
+        while lua54.lua_next(L, -2) != 0:
+            # dumpstack(L)
+            contents.append(Coroutine._to_python_type(t, i))
+            lua54.lua_pop(L, 1)
+            # dumpstack(L)
+            # print(lua54.lua_gettop(L))
+        lua54.lua_pop(L, 1)
         return contents
 
     def keys(self):
@@ -164,7 +232,7 @@ class Table(_LuaReferenceContainer):
                 if i not in allowed:
                     return False
             return True
-
+        
         try:
             clear = False
             if Table.REPRD_TABLES is None:
@@ -184,12 +252,40 @@ class Table(_LuaReferenceContainer):
         
         return s            
 
-class Coroutine():
+def dumpstack(L):
+    top = lua54.lua_gettop(L)
+    for i in range(1, top + 1):
+        t = lua54.lua_type(L, i)
+        print("%5s %5s " % (i, [
+            "nil          ",
+            "boolean      ",
+            "lightuserdata",
+            "number       ",
+            "string       ",
+            "table        ",
+            "function     ",
+            "userdata     ",
+            "thread       "
+        ][t]), end="")
+        if t == lua54.LUA_TNUMBER:
+            print("%.8f" % (lua54.lua_tonumberx(L,i,None)))
+        elif t == lua54.LUA_TSTRING:
+            print("%s" % (lua54.lua_tostring(L,i)))
+        elif t == lua54.LUA_TBOOLEAN:
+            print("%s" % ("true" if lua54.lua_toboolean(L, i) else "false"))
+        elif t == lua54.LUA_TNIL:
+            print("%s" % "nil")
+        else:
+            print("%d" % lua54.lua_topointer(L,i))
+    print()
 
+class Coroutine():
+    
     def __init__(self, runtime, args, dummy=False):
         self.started = False
         self.ended = dummy
         self.runtime = runtime
+        self.runtime.threads += 1
         self.args = args
         self.return_value = None
         self._nargs = 0
@@ -203,6 +299,7 @@ class Coroutine():
             raise
 
     def __del__(self):
+        self.runtime.threads -= 1
         lua54.luaL_unref(self.runtime.L, lua54.LUA_REGISTRYINDEX, self.ref)
     
     def __aiter__(self):
@@ -290,7 +387,15 @@ class Coroutine():
             lua54.lua_pushlstring(self.L, obj, len(obj))
         
         elif isinstance(obj, Table):
+            if isinstance(self, Coroutine) and obj._get_owner() is None:
+                obj._set_owner(self)
             obj._pushrefval()
+        
+        elif callable(obj):
+            # Assuming coroutine
+            cf = lua54.lua_CFunction(self.runtime._function_callback_gen(obj, "@CB" + str(id(obj))))
+            self.runtime._CFUNCTIONS.append(cf)
+            lua54.lua_pushcclosure(self.L, cf, 0)
         
         else:
             raise ValueError("Cannot convert %r into a Lua type" % obj)
@@ -350,12 +455,19 @@ class Coroutine():
 
 class Runtime():
     
-    def __init__(self, code, encoding="ascii"):
+    def __init__(self, code, encoding="ascii", filename=None):
         self._CFUNCTIONS = []
         self.encoding = encoding
+        self.runtime = self
+        self.threads = 0
         
         self.L = lua54.luaL_newstate()
-        lua54.luaL_loadstring(self.L, code.encode(self.encoding))
+        ecode = code.encode(self.encoding)
+        if filename is None:
+            lua54.luaL_loadstring(self.L, ecode)
+        else:
+            lua54.luaL_loadbufferx(self.L, ecode, len(ecode), b"@" + filename.encode(self.encoding), None)
+        
         if lua54.lua_type(self.L, -1) == lua54.LUA_TSTRING:
             raise ValueError(lua54.lua_tolstring(self.L, -1, None).decode(self.encoding))
         
@@ -388,7 +500,10 @@ class Runtime():
         lua54.lua_setglobal(self.L, name)
     
     def __del__(self):
-        self.lua54.lua_close(self.L)
+        if self.threads > 0:
+            # Interpreter exiting, cleanup doesn't matter
+            return
+        lua54.lua_close(self.L)
 
     def globals(self):
         try:
@@ -399,10 +514,12 @@ class Runtime():
         except OSError:
             print("OSError caught: stack top is", lua54.lua_gettop(self.dummy_coroutine.L))
             raise
-    
-    def register_command(self, callback, name, nargs=None):
+
+    def _function_callback_gen(self, f, name, nargs=None):
         def cb(state):
             cmd = name.encode(self.encoding)
+            # print(state)
+            # traceback.print_stack()
             nargs_passed = lua54.lua_gettop(state)
             # print(nargs_passed)
             lua54.lua_pushlstring(state, cmd, len(cmd))
@@ -410,11 +527,14 @@ class Runtime():
                 lua54.lua_pushinteger(state, nargs_passed)
             else:
                 lua54.lua_pushinteger(state, nargs)
-            self.function_to_call = callback
+            # self.function_to_call = callback
             return lua54.lua_yieldk(state, lua54.lua_gettop(state), 0, None)
         
-        self._register(name.encode(self.encoding), cb)
-        self.callbacks[name] = callback
+        self.callbacks[name] = f
+        return cb
+    
+    def register_command(self, callback, name, nargs=None):
+        self._register(name.encode(self.encoding), self._function_callback_gen(callback, name, nargs))
 
     def __iter__(self):
         return self
@@ -484,6 +604,9 @@ lua54.lua_compare      .decl(ctypes.c_int,       (lua54.lua_State_p, ctypes.c_in
 lua54.lua_newthread    .decl(lua54.lua_State_p,  (lua54.lua_State_p, ))
 lua54.lua_pushthread   .decl(ctypes.c_int,       (lua54.lua_State_p, lua54.lua_State_p))
 lua54.lua_xmove        .decl(c_void,             (lua54.lua_State_p, lua54.lua_State_p, ctypes.c_int))
+lua54.lua_createtable  .decl(c_void,             (lua54.lua_State_p, ctypes.c_int, ctypes.c_int))
+lua54.lua_settable     .decl(c_void,             (lua54.lua_State_p, ctypes.c_int))
+lua54.luaL_loadbufferx .decl(ctypes.c_int,       (lua54.lua_State_p, ctypes.c_char_p, size_t, ctypes.c_char_p, ctypes.c_char_p))
 
 def _lua_pop(state, n):
     lua54.lua_settop(state, -n-1)
@@ -492,6 +615,19 @@ lua54.lua_pop = _lua_pop
 import asyncio
 
 if __name__ == "__main__":
+    # import faulthandler
+    # faulthandler.enable()
+
+    async def lua_create_example_table(runtime):
+        t = Table.new(runtime)
+        t["modify_example_table"] = lua_modify_example_table
+        return t
+    
+    async def lua_modify_example_table(runtime, tself):
+        tself[1] = Table.new(runtime)
+        tself[1][1] = -1
+        tself[1][2] = -2
+    
     async def lua_print(runtime, *what):
         print("[lua]", *what)
 
@@ -555,6 +691,16 @@ if __name__ == "__main__":
         
         print("Done!")
 
+    async def main3():
+        with open("example.lua", "r") as f:
+            program = f.read()
+        
+        rt = Runtime(program, filename="example.lua")
+        rt.register_command(lua_print, "print")
+        rt.register_command(lua_create_example_table, "create_example_table")
+        await rt.globals()["table_init"]()
+        print("Done!")
+
     async def main():
         print("Example 1")
         await main1()
@@ -562,5 +708,9 @@ if __name__ == "__main__":
         await asyncio.sleep(2)
         print("Example 2")
         await main2()
+        print("==============================")
+        await asyncio.sleep(2)
+        print("Example 3")
+        await main3()
     
     asyncio.run(main())

@@ -1,5 +1,22 @@
 -- This file isn't needed to use the library
 
+function table_init()
+    local t = create_example_table()
+    
+    print("pre modify")
+    for k, v in pairs(t) do
+        print(k, v)
+    end
+    
+    t["hello"] = "world"
+    t:modify_example_table()
+    
+    print("post modify")
+    for k, v in pairs(t) do
+        print(k, v)
+    end
+end
+
 function main()
     local t1 = create_task(task, 0, 1, "[task 1] hello")
     local t2 = create_task(task, 0.25, 1, "[task 2] hello")
